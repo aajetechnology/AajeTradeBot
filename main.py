@@ -1,51 +1,34 @@
-import time
-import os
 import threading
+import os
+import time
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from bot_logic import get_market_analysis, get_all_tradable_assets
-from notifier import send_telegram_signal
+import uvicorn
+from bot_logic import run_scanner
 
-# 1. Create a dummy FastAPI app so Render/Gunicorn stays happy
-app = FastAPI()
+# --- LIFESPAN MANAGER ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # This runs when the server starts
+    print("🚀 Web server online. Starting Trading Bot thread...")
+    bot_thread = threading.Thread(target=run_scanner, daemon=True)
+    bot_thread.start()
+    yield
+    # This runs when the server shuts down
+    print("🛑 Shutting down...")
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def health_check():
-    return {"status": "Bot is running"}
-
-def run_scanner():
-    """The actual trading bot loop."""
-    print("🌍 Scanner Active. Searching for high-confidence trades...")
-    
-    # It's better to refresh the asset list inside the loop occasionally
-    assets = get_all_tradable_assets()
-
-    while True:
-        for symbol in assets:
-            print(f"🔍 Analyzing {symbol}...")
-            verdict, price = get_market_analysis(symbol)
-            
-            if verdict and "Confidence:" in verdict:
-                try:
-                    # Extract confidence number
-                    conf_val = int(verdict.split("Confidence:")[1].split("%")[0].strip())
-                    
-                    if conf_val >= 85:
-                        print(f"✅ Signal found: {symbol} at {conf_val}%")
-                        send_telegram_signal(symbol, verdict, price)
-                        time.sleep(30) # Wait after a signal
-                except Exception as e:
-                    print(f"⚠️ Error parsing verdict: {e}")
-            
-            # Rate limiting for Twelve Data Free Tier
-            time.sleep(12) 
-
-        print("🔄 Cycle complete. Restarting list...")
-
-# 2. Start the scanner in a separate thread so the Web Server can run at the same time
-@app.on_event("startup")
-def start_bot():
-    threading.Thread(target=run_scanner, daemon=True).start()
+    """Render hits this endpoint to verify the app is live."""
+    return {
+        "status": "Bot is active",
+        "timestamp": time.time(),
+        "info": "AajeTradeBot v1.0 Production"
+    }
 
 if __name__ == "__main__":
-    # This part runs when you start it on your laptop
-    run_scanner()
+    # This allows you to run locally with 'python main.py'
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
