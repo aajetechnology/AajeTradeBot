@@ -68,52 +68,87 @@ def get_finnhub_symbol(symbol: str) -> str:
     wait=wait_exponential(min=25, max=120),
     retry=retry_if_exception_type(Exception)
 )
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(min=25, max=120))
 def get_decision(symbol: str) -> Tuple[Optional[dict], Optional[float]]:
     global daily_credits_used
 
     logger.info(f"Analyzing {symbol}")
 
-    # ─── 1. Twelve Data fetch (credit-consuming) ─────────────────────────────
+    df = None
+    price = None
+    used_twelve_data = False
+
+    # ─── Primary: Try Twelve Data (full candles + indicators) ────────────────
     try:
         ts = td_client.time_series(symbol=symbol, interval="1min", outputsize=200)
         df = ts.as_pandas()
-        if df is None or len(df) < 70:
-            logger.warning(f"Insufficient data for {symbol}")
-            return None, None
-        daily_credits_used += 1
+        if df is not None and len(df) >= 70:
+            used_twelve_data = True
+            daily_credits_used += 1
+            price = float(df.iloc[-1]['close'])
     except Exception as e:
         err = str(e).lower()
         if any(x in err for x in ["credits", "limit", "429", "daily"]):
-            logger.warning(f"Twelve Data LIMIT → long sleep 120s...")
-            time.sleep(120)
-            raise
-        logger.warning(f"Twelve Data error {symbol}: {e}")
+            logger.warning(f"Twelve Data LIMIT → trying Finnhub fallback...")
+        else:
+            logger.warning(f"Twelve Data error {symbol}: {e}")
+
+    # ─── Fallback: Use Finnhub quote if Twelve Data failed ───────────────────
+    if not used_twelve_data:
+        try:
+            fh_symbol = get_finnhub_symbol(symbol)
+            quote = finnhub_client.quote(fh_symbol)
+            price = quote.get('c')
+            if price is None or price == 0:
+                raise ValueError("No valid price from Finnhub")
+            logger.info(f"Using Finnhub fallback price for {symbol}: {price}")
+        except Exception as e:
+            logger.error(f"Finnhub fallback also failed for {symbol}: {e}")
+            return None, None
+
+    # ─── If we have no price at all → skip ──────────────────────────────────
+    if price is None:
+        logger.warning(f"No price data available for {symbol} (both sources failed)")
         return None, None
 
-    # ─── 2. Indicators ────────────────────────────────────────────────────────
-    df.ta.rsi(length=14, append=True)
-    df.ta.ema(length=20, append=True)
-    df.ta.macd(append=True)
-    df.ta.bbands(length=20, std=2, append=True)
-    df.ta.adx(append=True)
+    # ─── Indicators (only if we have Twelve Data candles) ────────────────────
+    ind = {"price": price}
 
-    row = df.iloc[-1]
+    if df is not None:
+        df.ta.rsi(length=14, append=True)
+        df.ta.ema(length=20, append=True)
+        df.ta.macd(append=True)
+        df.ta.bbands(length=20, std=2, append=True)
+        df.ta.adx(append=True)
 
-    def safe_float(col: str, fallback=float('nan')) -> float:
-        return float(row[col]) if col in row else fallback
+        row = df.iloc[-1]
 
-    ind = {
-        "price": safe_float("close"),
-        "rsi": safe_float("RSI_14"),
-        "ema20": safe_float("EMA_20"),
-        "macd": safe_float("MACD_12_26_9"),
-        "macd_sig": safe_float("MACDs_12_26_9"),
-        "bb_upper": safe_float("BBU_20_2.0") or safe_float("BBU_20_2", float('nan')),
-        "bb_lower": safe_float("BBL_20_2.0") or safe_float("BBL_20_2", float('nan')),
-        "adx": safe_float("ADX_14"),
-    }
+        def safe_float(col: str, fallback=float('nan')) -> float:
+            return float(row[col]) if col in row else fallback
 
-    # ─── 3. News (Finnhub) ────────────────────────────────────────────────────
+        ind.update({
+            "rsi": safe_float("RSI_14"),
+            "ema20": safe_float("EMA_20"),
+            "macd": safe_float("MACD_12_26_9"),
+            "macd_sig": safe_float("MACDs_12_26_9"),
+            "bb_upper": safe_float("BBU_20_2.0") or safe_float("BBU_20_2", float('nan')),
+            "bb_lower": safe_float("BBL_20_2.0") or safe_float("BBL_20_2", float('nan')),
+            "adx": safe_float("ADX_14"),
+        })
+    else:
+        # Fallback mode: no indicators, only price + news
+        logger.info(f"Fallback mode for {symbol} – no indicators available")
+        ind.update({
+            "rsi": float('nan'),
+            "ema20": float('nan'),
+            "macd": float('nan'),
+            "macd_sig": float('nan'),
+            "bb_upper": float('nan'),
+            "bb_lower": float('nan'),
+            "adx": float('nan'),
+        })
+
+    # ─── News from Finnhub (always used) ─────────────────────────────────────
     try:
         cat = 'crypto' if any(c in symbol for c in ['BTC','ETH']) else 'forex'
         news = finnhub_client.general_news(cat, min_id=0)
@@ -122,35 +157,29 @@ def get_decision(symbol: str) -> Tuple[Optional[dict], Optional[float]]:
     except:
         news_text = "No news available"
 
-    # ─── 4. Smarter, more profitable prompt ───────────────────────────────────
-    dynamic_boost = (
-        "Increase confidence by 8–12 if trend is strong (ADX>28) and no conflicting news."
-        if ind["adx"] > 28 else
-        "Be cautious – lower confidence if ADX<20 or conflicting news."
-    )
+    # ─── Prompt – adjusted for fallback mode ─────────────────────────────────
+    fallback_note = "Note: Full indicators unavailable – decision based on price + news only." if not used_twelve_data else ""
 
-    prompt = f"""You are a high-conviction 2-minute binary options trader focused on high-probability setups.
+    prompt = f"""You are a high-conviction 2-minute binary options trader.
 
 Data for {symbol}:
 Price     : {ind['price']:.5f}
-RSI(14)   : {ind['rsi']:.1f}  (avoid extremes unless momentum strong)
-vs EMA20  : {'above (bullish bias)' if ind['price'] > ind['ema20'] else 'below (bearish bias)'}
-MACD      : {ind['macd']:.4f} (signal {ind['macd_sig']:.4f}) – direction & crossover key
-ADX(14)   : {ind['adx']:.1f}  (>28 = strong trend → higher confidence)
-BBands    : {'near upper (overbought)' if ind['price'] > ind['bb_upper']*0.98 else 'near lower (oversold)' if ind['price'] < ind['bb_lower']*1.02 else 'inside bands'}
+RSI(14)   : {ind['rsi']:.1f if not pd.isna(ind['rsi']) else 'N/A'}
+vs EMA20  : {'above (bullish)' if not pd.isna(ind['ema20']) and ind['price'] > ind['ema20'] else 'below (bearish)' if not pd.isna(ind['ema20']) else 'N/A'}
+MACD      : {ind['macd']:.4f if not pd.isna(ind['macd']) else 'N/A'} (sig {ind['macd_sig']:.4f if not pd.isna(ind['macd_sig']) else 'N/A'})
+ADX(14)   : {ind['adx']:.1f if not pd.isna(ind['adx']) else 'N/A'}
+BBands    : {'near upper' if not pd.isna(ind['bb_upper']) and ind['price'] > ind['bb_upper']*0.98 else 'near lower' if not pd.isna(ind['bb_lower']) and ind['price'] < ind['bb_lower']*1.02 else 'inside bands' if not pd.isna(ind['bb_upper']) else 'N/A'}
 News      : {news_text}
 
-{dynamic_boost}
+{fallback_note}
 
-Rules:
-- Prefer BUY/SELL when 3+ indicators align clearly
-- Use WAIT if signals conflict or ADX < 20
-- Target confidence 75–100 only on strong setups
+Be decisive but realistic. If full indicators are missing, rely more on news sentiment and recent price action.
+Prefer BUY/SELL when there's clear momentum or news support. Use WAIT if uncertain.
 
 Respond ONLY with valid JSON:
 {{
   "verdict": "BUY"|"SELL"|"WAIT",
-  "confidence": 70-100,
+  "confidence": 50-100,
   "reason": "short explanation max 70 chars"
 }}
 """
@@ -159,7 +188,7 @@ Respond ONLY with valid JSON:
         resp = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.18,          # Lower = more consistent
+            temperature=0.2,
             max_tokens=140
         )
         text = resp.choices[0].message.content.strip()
@@ -169,7 +198,7 @@ Respond ONLY with valid JSON:
     except Exception as e:
         logger.error(f"Groq error {symbol}: {e}")
         return None, None
-
+    
 def check_outcome(signal_id: str):
     if signal_id not in stats["pending"]:
         return
