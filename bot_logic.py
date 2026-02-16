@@ -34,7 +34,7 @@ groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
 # Config
 CONF_THRESHOLD = int(os.getenv('CONF_THRESHOLD', 84))
 SCAN_INTERVAL_SEC = int(os.getenv('SCAN_INTERVAL_SEC', 120))  # 2 minutes default
-GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama3-70b-8192')  # Updated to valid model
+GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama3-70b-8192')       # Valid current model
 
 # State
 stats = {"wins": 0, "losses": 0, "start": time.time(), "pending": {}}
@@ -49,12 +49,12 @@ def assets():
         "GBP/USD",
         "USD/JPY",
         "BTC/USD",
-        "ETH/USD",
-        "AUD/USD",
-        "USD/CAD",
-        "EUR/GBP",
-        "EUR/JPY",
-        "GBP/JPY"
+        # "ETH/USD",
+        # "AUD/USD",
+        # "USD/CAD",
+        # "EUR/GBP",
+        # "EUR/JPY",
+        # "GBP/JPY"
     ]
 
 def get_finnhub_symbol(symbol: str) -> str:
@@ -120,7 +120,7 @@ def get_decision(symbol: str) -> Tuple[Optional[dict], Optional[float]]:
     try:
         category = 'crypto' if 'USD' in symbol and any(c in symbol for c in ['BTC','ETH']) else 'forex'
         news_list = finnhub_client.general_news(category, min_id=0)
-        headlines = [n["headline"] for n in news_list[:3]] if news_list else ["—"]  # Get top 3 for better context
+        headlines = [n["headline"] for n in news_list[:3]] if news_list else ["—"]
         headline = " | ".join(headlines)
     except:
         headline = "—"
@@ -128,13 +128,14 @@ def get_decision(symbol: str) -> Tuple[Optional[dict], Optional[float]]:
     # 4. Structured prompt for Groq
     prompt = f"""Binary options analyst (2 min expiry).
 Data for {symbol}:
-Price : {ind['price']:.5f}
-RSI(14) : {ind['rsi']:.1f}
-vs EMA20 : {'above' if ind['price'] > ind['ema20'] else 'below'}
-MACD : {ind['macd']:.4f} (sig {ind['macd_sig']:.4f})
-ADX(14) : {ind['adx']:.1f}
-BBands : {'upper' if ind['price'] > ind['bb_upper']*0.98 else 'lower' if ind['price'] < ind['bb_lower']*1.02 else 'middle'}
-News : {headline}
+Price     : {ind['price']:.5f}
+RSI(14)   : {ind['rsi']:.1f}
+vs EMA20  : {'above' if ind['price'] > ind['ema20'] else 'below'}
+MACD      : {ind['macd']:.4f} (sig {ind['macd_sig']:.4f})
+ADX(14)   : {ind['adx']:.1f}
+BBands    : {'upper' if ind['price'] > ind['bb_upper']*0.98 else 'lower' if ind['price'] < ind['bb_lower']*1.02 else 'middle'}
+News      : {headline}
+
 Respond ONLY with valid JSON:
 {{
   "verdict": "BUY"|"SELL"|"WAIT",
@@ -168,7 +169,7 @@ def check_outcome(signal_id: str):
     entry = item["price"]
 
     try:
-        # Leverage Finnhub for outcome price (generous limits, saves Twelve Data credits)
+        # Leverage Finnhub for outcome price (saves Twelve Data credits)
         fh_symbol = get_finnhub_symbol(symbol)
         quote = finnhub_client.quote(fh_symbol)
         exit_price = quote.get('c', None)
@@ -265,14 +266,15 @@ def run_scanner():
         for sym in assets():
             logger.info(f"→ {sym}")
             analyze_one(sym)
-            time.sleep(15.0)  # Critical: keeps us under 8 credits/min
+            time.sleep(25.0)  
 
-            # Check daily limit after each fetch
-            if daily_credits_used >= 750:
-                logger.warning("Approaching daily Twelve Data limit → pausing until reset")
+           
+            if daily_credits_used >= 700:
+                logger.warning("Approaching daily Twelve Data limit (750/800) → pausing until reset")
                 utc_now = datetime.now(timezone.utc)
                 next_reset = (utc_now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
                 sleep_sec = (next_reset - utc_now).total_seconds()
+                logger.info(f"Pausing for ~{sleep_sec//3600:.1f} hours until reset")
                 time.sleep(sleep_sec)
                 daily_credits_used = 0
 
