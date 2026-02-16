@@ -256,3 +256,47 @@
 2026-02-16 03:22:48,701 | INFO    | Analyzing GBP/JPY
 2026-02-16 03:22:48,995 | WARNING | Twelve Data RATE LIMIT → sleeping 90s to reset minute...
 2026-02-16 03:23:40,731 | INFO    | Web server shutting down…
+2026-02-16 04:27:52,099 | INFO    | Starting uvicorn server on 0.0.0.0:8000
+2026-02-16 04:27:52,301 | INFO    | Web server starting. Launching scanner in background…
+2026-02-16 04:27:55,303 | INFO    | Starting trading scanner thread…
+2026-02-16 04:27:55,303 | INFO    | Scanner engine started 🚀 (free-tier safe + profitable mode)
+2026-02-16 04:27:55,304 | CRITICAL | Scanner thread crashed: name 'pytz' is not defined
+Traceback (most recent call last):
+  File "/home/user/Desktop/Trade/main.py", line 28, in delayed_bot_start
+    run_scanner()
+  File "/home/user/Desktop/Trade/bot_logic.py", line 293, in run_scanner
+    if not is_active_trading_session():
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Desktop/Trade/bot_logic.py", line 55, in is_active_trading_session
+    now_wat = datetime.now(pytz.timezone('Africa/Lagos'))
+                           ^^^^
+NameError: name 'pytz' is not defined
+2026-02-16 04:28:06,969 | INFO    | Web server shutting down…
+2026-02-16 04:29:22,079 | INFO    | Starting uvicorn server on 0.0.0.0:8000
+2026-02-16 04:29:22,225 | INFO    | Web server starting. Launching scanner in background…
+2026-02-16 04:29:25,226 | INFO    | Starting trading scanner thread…
+2026-02-16 04:29:25,227 | INFO    | Scanner engine started 🚀 (free-tier safe + profitable mode)
+2026-02-16 04:29:25,305 | INFO    | Outside active trading hours – sleeping 30 min
+2026-02-16 04:36:17,094 | INFO    | Web server shutting down…
+2026-02-16 04:36:29,551 | INFO    | Starting uvicorn server on 0.0.0.0:8000
+2026-02-16 04:36:29,697 | INFO    | Web server starting. Launching scanner in background…
+2026-02-16 04:36:32,700 | INFO    | Starting trading scanner thread…
+2026-02-16 04:36:32,701 | INFO    | Scanner engine started 🚀 (free-tier safe + profitable mode)
+2026-02-16 04:36:38,502 | INFO    | Telegram message sent successfully: SYSTEM (attempt 1)
+2026-02-16 04:36:38,505 | INFO    | Starting scan round ─ 04:36:38
+2026-02-16 04:36:38,506 | INFO    | → EUR/USD
+2026-02-16 04:36:38,506 | INFO    | Analyzing EUR/USD
+2026-02-16 04:36:38,784 | WARNING | Twelve Data LIMIT → long sleep 120s...
+2026-02-16 04:39:03,785 | INFO    | Analyzing EUR/USD
+2026-02-16 04:39:04,130 | WARNING | Twelve Data LIMIT → long sleep 120s...
+2026-02-16 04:40:18,997 | INFO    | Web server shutting down…
+2026-02-16 04:40:49,405 | INFO    | Starting uvicorn server on 0.0.0.0:8000
+2026-02-16 04:40:49,514 | INFO    | Web server starting. Launching scanner in background…
+2026-02-16 04:40:52,517 | INFO    | Starting trading scanner thread…
+2026-02-16 04:40:52,518 | INFO    | Scanner engine started 🚀 (free-tier safe + profitable mode)
+2026-02-16 04:40:53,328 | INFO    | Telegram message sent successfully: SYSTEM (attempt 1)
+2026-02-16 04:40:53,332 | INFO    | Starting scan round ─ 04:40:53
+2026-02-16 04:40:53,332 | INFO    | → EUR/USD
+2026-02-16 04:40:53,333 | INFO    | Analyzing EUR/USD
+2026-02-16 04:40:53,597 | WARNING | Twelve Data LIMIT → long sleep 120s...
+2026-02-16 04:41:22,770 | INFO    | Web server shutting down…
