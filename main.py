@@ -1,6 +1,5 @@
 import threading
 import os
-
 import time
 import logging
 from contextlib import asynccontextmanager
@@ -22,7 +21,7 @@ async def lifespan(app: FastAPI):
     logger.info("Web server starting. Launching scanner in background…")
 
     def delayed_bot_start():
-        # Short delay helps Render detect the port before heavy startup work
+        # Give Render time to detect the port and mark service healthy
         time.sleep(3)
         logger.info("Starting trading scanner thread…")
         try:
@@ -30,15 +29,15 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.critical(f"Scanner thread crashed: {e}", exc_info=True)
 
-    # Run scanner in background thread
+    # Launch scanner in background thread (daemon so it stops when app does)
     thread = threading.Thread(target=delayed_bot_start, daemon=True)
     thread.start()
 
-    yield  # App is now running
+    yield  # Application is running here
 
     logger.info("Web server shutting down…")
 
-# ─── FastAPI app ─────────────────────────────────────────────────────────────
+# ─── FastAPI application ─────────────────────────────────────────────────────
 app = FastAPI(lifespan=lifespan, title="AajeTrade Signal Bot")
 
 @app.get("/")
@@ -52,16 +51,17 @@ def health():
     }
 
 if __name__ == "__main__":
-    # Render sets PORT automatically – fallback to 8000 for local dev
+    # Render provides PORT via environment variable (usually 10000)
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"Starting uvicorn server on 0.0.0.0:{port}")
 
     uvicorn.run(
-        "main:app",                 
+        "main:app",                    # Correct module:app reference
         host="0.0.0.0",
         port=port,
         log_level="info",
-        workers=1,                  
+        workers=1,                     # Critical: single worker prevents port conflicts
         reload=False,
-        timeout_keep_alive=30       
+        timeout_keep_alive=30,         # Helps with long-running background tasks
+        timeout_graceful_shutdown=10   # Clean shutdown on Render SIGTERM
     )
