@@ -1,5 +1,6 @@
 import os
 import time
+import re  # Added for robust AI response parsing
 import finnhub
 import pandas as pd
 import pandas_ta as ta
@@ -11,8 +12,6 @@ from notifier import send_telegram_signal
 load_dotenv()
 
 # Initialize Clients
-# Note: Twelve Data SDK uses 'requests' under the hood. 
-# We'll use a retry loop to handle the timeout error you saw.
 td = TDClient(apikey=os.getenv('TWELVE_DATA_KEY'))
 fh_client = finnhub.Client(api_key=os.getenv('FINNHUB_API_KEY'))
 groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
@@ -29,7 +28,7 @@ def get_market_analysis(symbol):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # 1. Fetch Data (RSI/EMA needs ~100 rows for accuracy)
+            # 1. Fetch Data
             ts = td.time_series(symbol=symbol, interval="1min", outputsize=100)
             df = ts.as_pandas()
             
@@ -41,7 +40,7 @@ def get_market_analysis(symbol):
             df['EMA'] = ta.ema(df['close'], length=20)
             last_row = df.dropna().iloc[-1]
 
-            # 3. News (Secondary data, if it fails we still trade)
+            # 3. News 
             try:
                 news = fh_client.general_news('forex', min_id=0)
                 headline = news[0]['headline'] if news else "Stable Market"
@@ -63,20 +62,41 @@ def get_market_analysis(symbol):
         except Exception as e:
             if "timeout" in str(e).lower() and attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 5
-                print(f"🔄 Timeout for {symbol}. Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})")
+                print(f"🔄 Timeout for {symbol}. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
                 continue
             print(f"⚠️ Analysis Error ({symbol}): {e}")
             return None, None
 
 def run_scanner():
-    """Main loop with Heartbeat and Risk Guardrails."""
+    """Main loop with Heartbeat and AI-Safe Parsing."""
     print("🚀 Trading Bot Engine Started...")
     
+    # Track the best setup found so you know the bot is "thinking"
+    hourly_best = {"symbol": "None", "conf": 0}
+    last_heartbeat = time.time()
+    
     while True:
-        # Reset daily stats
+        # Reset daily stats every 24h
         if time.time() - trade_stats["start_time"] > 86400:
             trade_stats.update({"wins": 0, "losses": 0, "start_time": time.time()})
+
+        # --- NEW: HOURLY HEARTBEAT ---
+        # Sends a Telegram update every 60 minutes even if no trade is found
+        if time.time() - last_heartbeat > 3600:
+            heartbeat_msg = (
+                f"📡 **BOT HEARTBEAT**\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"✅ Status: `Active & Scanning`\n"
+                f"🔝 Best Setup this hour: `{hourly_best['symbol']} ({hourly_best['conf']}%)`\n"
+                f"🕒 Next update in: `60 mins`"
+            )
+            # Use your notifier to send a simple text
+            send_telegram_signal("SYSTEM", heartbeat_msg, "N/A")
+            
+            # Reset heartbeat trackers
+            last_heartbeat = time.time()
+            hourly_best = {"symbol": "None", "conf": 0}
 
         if trade_stats["losses"] >= DAILY_LOSS_LIMIT:
             print("🛑 Daily limit reached. Paused for 1 hour.")
@@ -91,14 +111,21 @@ def run_scanner():
             
             if verdict and "Confidence:" in verdict:
                 try:
-                    conf = int(verdict.split("Confidence:")[1].split("%")[0].strip())
-                    if conf >= 85:
-                        print(f"✅ SIGNAL FOUND: {symbol} ({conf}%)")
-                        send_telegram_signal(symbol, verdict, price)
-                        time.sleep(30) # Prevent multiple signals for same asset
+                    conf_match = re.search(r'Confidence:\s*[\*]*(\d+)', verdict)
+                    if conf_match:
+                        conf = int(conf_match.group(1))
+                        
+                        # Update the hourly best tracker
+                        if conf > hourly_best["conf"]:
+                            hourly_best = {"symbol": symbol, "conf": conf}
+
+                        if conf >= 85:
+                            print(f"✅ SIGNAL FOUND: {symbol} ({conf}%)")
+                            send_telegram_signal(symbol, verdict, price)
+                            time.sleep(30) 
+                        else:
+                            print(f"➖ Low confidence ({conf}%) for {symbol}")
                 except Exception as parse_err:
-                    print(f"⚙️ Parsing Error: {parse_err}")
+                    print(f"⚠️ Parsing Error: {parse_err}")
             
-            # Twelve Data Free Tier: Max 8 requests/min. 
-            # 12s sleep per symbol ensures we stay under the limit safely.
             time.sleep(12)

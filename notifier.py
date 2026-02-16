@@ -4,7 +4,7 @@ import pytz
 from datetime import datetime, timedelta
 
 def send_telegram_signal(symbol, verdict_text, price):
-    """Formats and sends a high-quality trading signal to Telegram."""
+    """Formats and sends trading signals or system heartbeats to Telegram."""
     
     # 1. Load Credentials Safely
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -14,18 +14,32 @@ def send_telegram_signal(symbol, verdict_text, price):
         print("⚠️ Telegram credentials missing. Signal not sent.")
         return
 
-    # 2. Extract Direction and Confidence
-    # Adding emoji support for better user readability
+    # 2. Handle System Heartbeats (New Feature)
+    # If the symbol is 'SYSTEM', we skip trade formatting and send a plain message.
+    if symbol == "SYSTEM":
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id, 
+            "text": verdict_text, 
+            "parse_mode": "Markdown"
+        }
+        try:
+            requests.post(url, data=payload, timeout=10)
+            print("📡 Heartbeat sent to Telegram.")
+        except Exception as e:
+            print(f"❌ Heartbeat failed: {e}")
+        return
+
+    # 3. Extract Direction and Confidence for Trades
     direction_raw = "BUY" if "BUY" in verdict_text.upper() else "SELL"
     emoji = "🟢 CALL" if direction_raw == "BUY" else "🔴 PUT"
     
-    try:
-        # Improved parsing to handle different AI response formats
-        confidence = verdict_text.split("Confidence:")[1].split("%")[0].strip() + "%"
-    except (IndexError, AttributeError):
-        confidence = "85%+"
+    # Robust Confidence Extraction
+    import re
+    conf_match = re.search(r'(\d+)%', verdict_text)
+    confidence = f"{conf_match.group(1)}%" if conf_match else "85%+"
 
-    # 3. Time Management (Nigeria Time Zone)
+    # 4. Time Management (Nigeria Time Zone)
     lagos_tz = pytz.timezone('Africa/Lagos')
     now = datetime.now(lagos_tz)
     
@@ -35,11 +49,10 @@ def send_telegram_signal(symbol, verdict_text, price):
     m2 = (now + timedelta(minutes=4)).strftime("%H:%M")
     m3 = (now + timedelta(minutes=6)).strftime("%H:%M")
 
-    # 4. Professional Signal Template
-    # We use bold and code blocks (backticks) for a premium look
+    # 5. Professional Signal Template
     message = (
         f"🌟 **AAJE AI PREMIUM SIGNAL** 🌟\n\n"
-        f"📊 **ASSET:** `{symbol} (OTC)`\n"
+        f"📊 **ASSET:** `{symbol}`\n"
         f"🎯 **PRICE:** `{price}`\n"
         f"↕️ **DIRECTION:** `{emoji}`\n"
         f"⏰ **ENTRY:** `{entry_time}`\n"
@@ -52,7 +65,7 @@ def send_telegram_signal(symbol, verdict_text, price):
         f"⚠️ *Risk Warning: Only trade with 1-3% of your balance.*"
     )
 
-    # 5. Execute Request with Timeout
+    # 6. Execute Request
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id, 
@@ -67,4 +80,4 @@ def send_telegram_signal(symbol, verdict_text, price):
         else:
             print(f"❌ Telegram Error: {response.text}")
     except requests.exceptions.RequestException as e:
-        print(f"📡 Network Error: Could not reach Telegram: {e}")
+        print(f"📡 Network Error: {e}")
