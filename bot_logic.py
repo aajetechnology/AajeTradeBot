@@ -2,8 +2,9 @@ import os
 import time
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
+import threading
 
 import finnhub
 import pandas as pd
@@ -31,43 +32,53 @@ finnhub_client = finnhub.Client(api_key=os.getenv('FINNHUB_API_KEY'))
 groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
 
 # Config
-CONF_THRESHOLD    = int(os.getenv('CONF_THRESHOLD', 84))
+CONF_THRESHOLD = int(os.getenv('CONF_THRESHOLD', 84))
 SCAN_INTERVAL_SEC = int(os.getenv('SCAN_INTERVAL_SEC', 120))  # 2 minutes default
-GROQ_MODEL        = os.getenv('GROQ_MODEL', 'mixtral-8x7b-32768')
+GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama3-70b-8192')  # Updated to valid model
 
 # State
 stats = {"wins": 0, "losses": 0, "start": time.time(), "pending": {}}
 hourly_best = {"symbol": "—", "conf": 0}
 last_heartbeat = 0.0
+daily_credits_used = 0
 
 def assets():
-    """Keep small number while on free tier — add more after upgrade"""
+    """Expanded for wide asset analysis — but monitored to stay under daily limit"""
     return [
         "EUR/USD",
         "GBP/USD",
         "USD/JPY",
         "BTC/USD",
         "ETH/USD",
-        # "AUD/USD",
-        # "USD/CAD",
-        # "EUR/GBP",
-        # "EUR/JPY",
+        "AUD/USD",
+        "USD/CAD",
+        "EUR/GBP",
+        "EUR/JPY",
         "GBP/JPY"
     ]
 
+def get_finnhub_symbol(symbol: str) -> str:
+    """Map to Finnhub symbol format for quote/news"""
+    if '/' in symbol and 'BTC' not in symbol and 'ETH' not in symbol:
+        return 'OANDA:' + symbol.replace('/', '_')
+    else:
+        return 'BINANCE:' + symbol.replace('/', '')
 
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=15, max=60))
 def get_decision(symbol: str) -> Tuple[Optional[dict], Optional[float]]:
     """Fetch data, compute indicators, ask Groq — with safe column handling"""
+    global daily_credits_used
+
     logger.info(f"Analyzing {symbol}")
 
-    # 1. Time series data (this is the credit-consuming call)
+    # 1. Time series data from Twelve Data (credit-consuming)
     try:
         ts = td_client.time_series(symbol=symbol, interval="1min", outputsize=180)
         df = ts.as_pandas()
         if df is None or len(df) < 60:
             logger.warning(f"Insufficient data for {symbol}")
             return None, None
+        daily_credits_used += 1  # Count successful fetch
     except Exception as e:
         err_str = str(e).lower()
         if "api credits" in err_str or "out of api credits" in err_str or "429" in err_str or "limit being 8" in err_str:
@@ -105,28 +116,26 @@ def get_decision(symbol: str) -> Tuple[Optional[dict], Optional[float]]:
     # Optional: uncomment once to see actual column names in your environment
     # logger.info(f"TA columns for {symbol}: {list(df.columns)}")
 
-    # 3. News from Finnhub (cheap & generous limit)
+    # 3. Enhanced news from Finnhub (leverage for wider analysis, generous limits)
     try:
         category = 'crypto' if 'USD' in symbol and any(c in symbol for c in ['BTC','ETH']) else 'forex'
-        news = finnhub_client.general_news(category, min_id=0)
-        headline = news[0]["headline"][:140] if news else "—"
+        news_list = finnhub_client.general_news(category, min_id=0)
+        headlines = [n["headline"] for n in news_list[:3]] if news_list else ["—"]  # Get top 3 for better context
+        headline = " | ".join(headlines)
     except:
         headline = "—"
 
     # 4. Structured prompt for Groq
     prompt = f"""Binary options analyst (2 min expiry).
 Data for {symbol}:
-
-Price     : {ind['price']:.5f}
-RSI(14)   : {ind['rsi']:.1f}
-vs EMA20  : {'above' if ind['price'] > ind['ema20'] else 'below'}
-MACD      : {ind['macd']:.4f}  (sig {ind['macd_sig']:.4f})
-ADX(14)   : {ind['adx']:.1f}
-BBands    : {'upper' if ind['price'] > ind['bb_upper']*0.98 else 'lower' if ind['price'] < ind['bb_lower']*1.02 else 'middle'}
-News      : {headline}
-
+Price : {ind['price']:.5f}
+RSI(14) : {ind['rsi']:.1f}
+vs EMA20 : {'above' if ind['price'] > ind['ema20'] else 'below'}
+MACD : {ind['macd']:.4f} (sig {ind['macd_sig']:.4f})
+ADX(14) : {ind['adx']:.1f}
+BBands : {'upper' if ind['price'] > ind['bb_upper']*0.98 else 'lower' if ind['price'] < ind['bb_lower']*1.02 else 'middle'}
+News : {headline}
 Respond ONLY with valid JSON:
-
 {{
   "verdict": "BUY"|"SELL"|"WAIT",
   "confidence": 50-100,
@@ -143,11 +152,11 @@ Respond ONLY with valid JSON:
         )
         text = resp.choices[0].message.content.strip()
         data = json.loads(text)
+        logger.info(f"AI decision for {symbol}: {data}")  # Debug: see every decision
         return data, ind["price"]
     except Exception as e:
         logger.error(f"Groq / parse error {symbol}: {e}")
         return None, None
-
 
 def check_outcome(signal_id: str):
     if signal_id not in stats["pending"]:
@@ -159,11 +168,12 @@ def check_outcome(signal_id: str):
     entry = item["price"]
 
     try:
-        ts = td_client.time_series(symbol=symbol, interval="1min", outputsize=1)
-        df = ts.as_pandas()
-        if df.empty:
-            return
-        exit_price = float(df.iloc[-1]["close"])
+        # Leverage Finnhub for outcome price (generous limits, saves Twelve Data credits)
+        fh_symbol = get_finnhub_symbol(symbol)
+        quote = finnhub_client.quote(fh_symbol)
+        exit_price = quote.get('c', None)
+        if exit_price is None or exit_price == 0:
+            raise ValueError("Invalid quote from Finnhub")
 
         won = (direction == "BUY" and exit_price > entry) or \
               (direction == "SELL" and exit_price < entry)
@@ -186,7 +196,6 @@ def check_outcome(signal_id: str):
     except Exception as e:
         logger.error(f"Outcome check failed {symbol}: {e}")
 
-
 def analyze_one(symbol: str):
     global hourly_best
 
@@ -204,7 +213,7 @@ def analyze_one(symbol: str):
         return
 
     reason = decision.get("reason", "AI signal")
-    text = f"{dir_}  {conf}%  – {reason}"
+    text = f"{dir_} {conf}% – {reason}"
     send_telegram_signal(symbol, text, price)
 
     # Schedule outcome check (~2.75 min later)
@@ -213,7 +222,6 @@ def analyze_one(symbol: str):
     threading.Timer(165, check_outcome, args=(sid,)).start()
 
     logger.info(f"Signal sent → {symbol} {dir_} @ {conf}%")
-
 
 def heartbeat():
     global last_heartbeat, hourly_best
@@ -228,8 +236,9 @@ def heartbeat():
     hourly_best = {"symbol": "—", "conf": 0}
     last_heartbeat = time.time()
 
-
 def run_scanner():
+    global daily_credits_used
+
     logger.info("Scanner engine started 🚀 (free-tier safe mode)")
 
     while True:
@@ -238,7 +247,8 @@ def run_scanner():
         # Daily reset
         if now - stats["start"] > 86400:
             stats.update({"wins": 0, "losses": 0, "start": now})
-            logger.info("Daily stats reset")
+            daily_credits_used = 0  # Reset credit counter too
+            logger.info("Daily stats and credits reset")
 
         # Loss limit pause
         if stats["losses"] >= 6:
@@ -255,11 +265,19 @@ def run_scanner():
         for sym in assets():
             logger.info(f"→ {sym}")
             analyze_one(sym)
-            time.sleep(15.0)          # Critical: keeps us under 8 credits/min
+            time.sleep(15.0)  # Critical: keeps us under 8 credits/min
+
+            # Check daily limit after each fetch
+            if daily_credits_used >= 750:
+                logger.warning("Approaching daily Twelve Data limit → pausing until reset")
+                utc_now = datetime.now(timezone.utc)
+                next_reset = (utc_now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                sleep_sec = (next_reset - utc_now).total_seconds()
+                time.sleep(sleep_sec)
+                daily_credits_used = 0
 
         logger.info(f"Round finished ─ sleeping {SCAN_INTERVAL_SEC} seconds")
         time.sleep(SCAN_INTERVAL_SEC)
-
 
 if __name__ == "__main__":
     try:
