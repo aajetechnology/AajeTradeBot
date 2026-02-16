@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 import threading
 import pytz
+import yfinance as yf
 
 import finnhub
 import pandas as pd
@@ -13,7 +14,7 @@ import pandas_ta as ta
 from twelvedata import TDClient
 from groq import Groq
 from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from notifier import send_telegram_signal
 
@@ -33,22 +34,21 @@ finnhub_client = finnhub.Client(api_key=os.getenv('FINNHUB_API_KEY'))
 groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-CONF_THRESHOLD_BASE = int(os.getenv('CONF_THRESHOLD', 82))      # Starting point
-MIN_CONF_FOR_SIGNAL = 74                                        # Hard minimum
-SCAN_INTERVAL_SEC = int(os.getenv('SCAN_INTERVAL_SEC', 240))    # 4 minutes – very safe
-GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama-3.1-70b-versatile') # Current best free model
-MAX_DAILY_CREDITS = 780                                         # Stop well before 800
-CREDITS_WARNING_THRESHOLD = 650                                 # Alert earlier
+CONF_THRESHOLD_BASE = int(os.getenv('CONF_THRESHOLD', 82))
+MIN_CONF_FOR_SIGNAL = 74
+SCAN_INTERVAL_SEC = int(os.getenv('SCAN_INTERVAL_SEC', 240))
+GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama-3.1-70b-versatile')
+MAX_DAILY_CREDITS = 780
+CREDITS_WARNING_THRESHOLD = 650
 
 # ─── State ────────────────────────────────────────────────────────────────────
 stats = {"wins": 0, "losses": 0, "start": time.time(), "pending": {}}
 hourly_best = {"symbol": "—", "conf": 0}
 last_heartbeat = 0.0
 daily_credits_used = 0
-recent_win_rate = 0.50  # Initialize neutral – used for dynamic threshold
+recent_win_rate = 0.50
 
 def assets():
-    """Balanced, high-liquidity list – stays under limit"""
     return [
         "EUR/USD",
         "GBP/USD",
@@ -63,11 +63,6 @@ def get_finnhub_symbol(symbol: str) -> str:
         return 'OANDA:' + symbol.replace('/', '_')
     return 'BINANCE:' + symbol.replace('/', '')
 
-@retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(min=25, max=120),
-    retry=retry_if_exception_type(Exception)
-)
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=25, max=120))
 def get_decision(symbol: str) -> Tuple[Optional[dict], Optional[float]]:
     global daily_credits_used
@@ -76,45 +71,62 @@ def get_decision(symbol: str) -> Tuple[Optional[dict], Optional[float]]:
 
     df = None
     price = None
-    used_twelve_data = False
+    source = "unknown"
 
-    # ─── Primary: Try Twelve Data (full candles + indicators) ────────────────
+    # 1. Twelve Data (primary)
     try:
         ts = td_client.time_series(symbol=symbol, interval="1min", outputsize=200)
         df = ts.as_pandas()
         if df is not None and len(df) >= 70:
-            used_twelve_data = True
+            source = "TwelveData"
             daily_credits_used += 1
             price = float(df.iloc[-1]['close'])
+            logger.info(f"TwelveData success: price = {price}")
     except Exception as e:
         err = str(e).lower()
         if any(x in err for x in ["credits", "limit", "429", "daily"]):
-            logger.warning(f"Twelve Data LIMIT → trying Finnhub fallback...")
+            logger.warning("TwelveData LIMIT → trying Finnhub...")
         else:
-            logger.warning(f"Twelve Data error {symbol}: {e}")
+            logger.warning(f"TwelveData error: {e}")
 
-    # ─── Fallback: Use Finnhub quote if Twelve Data failed ───────────────────
-    if not used_twelve_data:
+    # 2. Finnhub quote fallback
+    if price is None:
         try:
             fh_symbol = get_finnhub_symbol(symbol)
             quote = finnhub_client.quote(fh_symbol)
             price = quote.get('c')
-            if price is None or price == 0:
-                raise ValueError("No valid price from Finnhub")
-            logger.info(f"Using Finnhub fallback price for {symbol}: {price}")
+            if price is not None and price > 0:
+                source = "Finnhub"
+                logger.info(f"Finnhub success: price = {price}")
         except Exception as e:
-            logger.error(f"Finnhub fallback also failed for {symbol}: {e}")
-            return None, None
+            logger.debug(f"Finnhub failed: {e}")
 
-    # ─── If we have no price at all → skip ──────────────────────────────────
+    # 3. yfinance ultimate fallback
     if price is None:
-        logger.warning(f"No price data available for {symbol} (both sources failed)")
+        try:
+            yf_symbol = symbol.replace('/', '') + '=X' if '/' in symbol else symbol + '-USD'
+            ticker = yf.Ticker(yf_symbol)
+            hist = ticker.history(period="5d", interval="1m")
+            if not hist.empty:
+                df = hist[['Open', 'High', 'Low', 'Close', 'Volume']].rename(
+                    columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}
+                )
+                price = float(df.iloc[-1]['close'])
+                source = "yfinance"
+                logger.info(f"yfinance success: price = {price}")
+            else:
+                raise ValueError("No yfinance data")
+        except Exception as e:
+            logger.error(f"yfinance failed: {e}")
+
+    if price is None:
+        logger.warning(f"No price from any source for {symbol}")
         return None, None
 
-    # ─── Indicators (only if we have Twelve Data candles) ────────────────────
+    # ─── Indicators (full mode) ──────────────────────────────────────────────
     ind = {"price": price}
 
-    if df is not None:
+    if df is not None and len(df) >= 70:
         df.ta.rsi(length=14, append=True)
         df.ta.ema(length=20, append=True)
         df.ta.macd(append=True)
@@ -136,45 +148,51 @@ def get_decision(symbol: str) -> Tuple[Optional[dict], Optional[float]]:
             "adx": safe_float("ADX_14"),
         })
     else:
-        # Fallback mode: no indicators, only price + news
-        logger.info(f"Fallback mode for {symbol} – no indicators available")
+        logger.info(f"Limited mode for {symbol} – price + news only")
         ind.update({
-            "rsi": float('nan'),
-            "ema20": float('nan'),
-            "macd": float('nan'),
-            "macd_sig": float('nan'),
-            "bb_upper": float('nan'),
-            "bb_lower": float('nan'),
+            "rsi": float('nan'), "ema20": float('nan'), "macd": float('nan'),
+            "macd_sig": float('nan'), "bb_upper": float('nan'), "bb_lower": float('nan'),
             "adx": float('nan'),
         })
 
-    # ─── News from Finnhub (always used) ─────────────────────────────────────
+    # ─── News ────────────────────────────────────────────────────────────────
+    news_text = "No news available"
     try:
         cat = 'crypto' if any(c in symbol for c in ['BTC','ETH']) else 'forex'
         news = finnhub_client.general_news(cat, min_id=0)
         headlines = [n["headline"][:120] for n in news[:5]] if news else ["Stable market"]
         news_text = " | ".join(headlines)
     except:
-        news_text = "No news available"
+        pass
 
-    # ─── Prompt – adjusted for fallback mode ─────────────────────────────────
-    fallback_note = "Note: Full indicators unavailable – decision based on price + news only." if not used_twelve_data else ""
+    # ─── Safe formatted values for prompt ────────────────────────────────────
+    rsi_fmt = f"{ind['rsi']:.1f}" if not pd.isna(ind['rsi']) else 'N/A'
+    ema_fmt = 'above (bullish)' if not pd.isna(ind['ema20']) and ind['price'] > ind['ema20'] else \
+              'below (bearish)' if not pd.isna(ind['ema20']) else 'N/A'
+    macd_fmt = f"{ind['macd']:.4f}" if not pd.isna(ind['macd']) else 'N/A'
+    macd_sig_fmt = f"{ind['macd_sig']:.4f}" if not pd.isna(ind['macd_sig']) else 'N/A'
+    adx_fmt = f"{ind['adx']:.1f}" if not pd.isna(ind['adx']) else 'N/A'
+    bb_fmt = 'near upper' if not pd.isna(ind['bb_upper']) and ind['price'] > ind['bb_upper']*0.98 else \
+             'near lower' if not pd.isna(ind['bb_lower']) and ind['price'] < ind['bb_lower']*1.02 else \
+             'inside bands' if not pd.isna(ind['bb_upper']) else 'N/A'
+
+    limited_note = "Note: Limited mode (API quota) – price + news only." if source != "TwelveData" else ""
 
     prompt = f"""You are a high-conviction 2-minute binary options trader.
 
 Data for {symbol}:
 Price     : {ind['price']:.5f}
-RSI(14)   : {ind['rsi']:.1f if not pd.isna(ind['rsi']) else 'N/A'}
-vs EMA20  : {'above (bullish)' if not pd.isna(ind['ema20']) and ind['price'] > ind['ema20'] else 'below (bearish)' if not pd.isna(ind['ema20']) else 'N/A'}
-MACD      : {ind['macd']:.4f if not pd.isna(ind['macd']) else 'N/A'} (sig {ind['macd_sig']:.4f if not pd.isna(ind['macd_sig']) else 'N/A'})
-ADX(14)   : {ind['adx']:.1f if not pd.isna(ind['adx']) else 'N/A'}
-BBands    : {'near upper' if not pd.isna(ind['bb_upper']) and ind['price'] > ind['bb_upper']*0.98 else 'near lower' if not pd.isna(ind['bb_lower']) and ind['price'] < ind['bb_lower']*1.02 else 'inside bands' if not pd.isna(ind['bb_upper']) else 'N/A'}
+RSI(14)   : {rsi_fmt}
+vs EMA20  : {ema_fmt}
+MACD      : {macd_fmt} (sig {macd_sig_fmt})
+ADX(14)   : {adx_fmt}
+BBands    : {bb_fmt}
 News      : {news_text}
 
-{fallback_note}
+{limited_note}
 
-Be decisive but realistic. If full indicators are missing, rely more on news sentiment and recent price action.
-Prefer BUY/SELL when there's clear momentum or news support. Use WAIT if uncertain.
+Be decisive but realistic in limited mode. Use news and price heavily.
+Prefer BUY/SELL on strong clues. Use WAIT if uncertain.
 
 Respond ONLY with valid JSON:
 {{
@@ -193,12 +211,12 @@ Respond ONLY with valid JSON:
         )
         text = resp.choices[0].message.content.strip()
         data = json.loads(text)
-        logger.info(f"AI decision {symbol}: {data}")
+        logger.info(f"AI decision {symbol} (source: {source}): {data}")
         return data, ind["price"]
     except Exception as e:
         logger.error(f"Groq error {symbol}: {e}")
         return None, None
-    
+
 def check_outcome(signal_id: str):
     if signal_id not in stats["pending"]:
         return
@@ -233,7 +251,6 @@ def check_outcome(signal_id: str):
         )
         send_telegram_signal("SYSTEM", msg, None)
 
-        # Update recent win rate (weighted moving average)
         global recent_win_rate
         recent_win_rate = recent_win_rate * 0.65 + (1 if won else 0) * 0.35
 
@@ -250,7 +267,6 @@ def analyze_one(symbol: str):
     conf = decision.get("confidence", 0)
     dir_ = decision["verdict"]
 
-    # Dynamic threshold: lower if recent performance good
     effective_threshold = CONF_THRESHOLD_BASE
     if recent_win_rate > 0.60:
         effective_threshold = max(72, CONF_THRESHOLD_BASE - 6)
@@ -261,7 +277,7 @@ def analyze_one(symbol: str):
         hourly_best.update({"symbol": symbol, "conf": conf})
 
     if conf < effective_threshold:
-        logger.info(f"Skipped {symbol} – conf {conf}% < effective {effective_threshold}%")
+        logger.info(f"Skipped {symbol} – conf {conf}% < {effective_threshold}%")
         return
 
     reason = decision.get("reason", "AI signal")
@@ -297,19 +313,16 @@ def run_scanner():
     while True:
         now = time.time()
 
-        # Daily reset
         if now - stats["start"] > 86400:
             stats.update({"wins": 0, "losses": 0, "start": now})
             daily_credits_used = 0
             logger.info("Daily stats & credits reset")
 
-        # Loss limit
         if stats["losses"] >= 6:
-            logger.warning("Daily loss limit reached → pause 60 min")
+            logger.warning("Loss limit reached → pause 60 min")
             time.sleep(3600)
             continue
 
-        # Heartbeat
         if now - last_heartbeat > 3540:
             heartbeat()
 
@@ -318,16 +331,15 @@ def run_scanner():
         for sym in assets():
             logger.info(f"→ {sym}")
             analyze_one(sym)
-            time.sleep(30.0)  # Very safe: ~2 calls/min max
+            time.sleep(30.0)
 
-            # Daily credit protection
             if daily_credits_used >= CREDITS_WARNING_THRESHOLD:
-                logger.warning(f"Approaching limit ({daily_credits_used}/{MAX_DAILY_CREDITS}) → early pause warning")
-                alert_msg = f"⚠️ Credit alert: {daily_credits_used}/{MAX_DAILY_CREDITS} used. Bot will pause at 780."
+                logger.warning(f"Approaching limit ({daily_credits_used}/{MAX_DAILY_CREDITS})")
+                alert_msg = f"⚠️ Credit alert: {daily_credits_used}/{MAX_DAILY_CREDITS} used. Pause at 780."
                 send_telegram_signal("SYSTEM", alert_msg, None)
 
             if daily_credits_used >= MAX_DAILY_CREDITS - 20:
-                logger.warning(f"CRITICAL: {daily_credits_used} credits used → pausing until reset")
+                logger.warning(f"CRITICAL: {daily_credits_used} used → pausing until reset")
                 utc_now = datetime.now(timezone.utc)
                 next_reset = (utc_now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
                 sleep_sec = (next_reset - utc_now).total_seconds()

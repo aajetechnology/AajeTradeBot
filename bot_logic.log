@@ -300,3 +300,70 @@ NameError: name 'pytz' is not defined
 2026-02-16 04:40:53,333 | INFO    | Analyzing EUR/USD
 2026-02-16 04:40:53,597 | WARNING | Twelve Data LIMIT → long sleep 120s...
 2026-02-16 04:41:22,770 | INFO    | Web server shutting down…
+2026-02-16 05:11:52,541 | INFO    | Starting uvicorn server on 0.0.0.0:8000
+2026-02-16 05:11:52,613 | INFO    | Web server starting. Launching scanner in background…
+2026-02-16 05:11:55,614 | INFO    | Starting trading scanner thread…
+2026-02-16 05:11:55,615 | INFO    | Scanner engine started 🚀 (free-tier safe + profitable mode)
+2026-02-16 05:12:01,424 | INFO    | Telegram message sent successfully: SYSTEM (attempt 1)
+2026-02-16 05:12:01,427 | INFO    | Starting scan round ─ 05:12:01
+2026-02-16 05:12:01,427 | INFO    | → EUR/USD
+2026-02-16 05:12:01,428 | INFO    | Analyzing EUR/USD
+2026-02-16 05:12:01,715 | WARNING | Twelve Data LIMIT HIT → trying Finnhub fallback...
+2026-02-16 05:12:11,854 | INFO    | yfinance fallback success for EUR/USD: price = 1.1870845556259155
+2026-02-16 05:12:39,673 | INFO    | Analyzing EUR/USD
+2026-02-16 05:12:39,959 | WARNING | Twelve Data LIMIT HIT → trying Finnhub fallback...
+2026-02-16 05:12:40,714 | INFO    | yfinance fallback success for EUR/USD: price = 1.1870845556259155
+2026-02-16 05:12:41,004 | CRITICAL | Scanner thread crashed: RetryError[<Future at 0x77ff3030fa10 state=finished raised ValueError>]
+Traceback (most recent call last):
+  File "/home/user/Desktop/Trade/venv/lib/python3.12/site-packages/tenacity/__init__.py", line 473, in __call__
+    result = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Desktop/Trade/bot_logic.py", line 178, in get_decision
+    RSI(14)   : {ind['rsi']:.1f if not pd.isna(ind['rsi']) else 'N/A'}
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: Invalid format specifier '.1f if not pd.isna(ind['rsi']) else 'N/A'' for object of type 'float'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/user/Desktop/Trade/main.py", line 29, in delayed_bot_start
+    run_scanner()
+  File "/home/user/Desktop/Trade/bot_logic.py", line 329, in run_scanner
+    analyze_one(sym)
+  File "/home/user/Desktop/Trade/bot_logic.py", line 256, in analyze_one
+    decision, price = get_decision(symbol)
+                      ^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Desktop/Trade/venv/lib/python3.12/site-packages/tenacity/__init__.py", line 331, in wrapped_f
+    return copy(f, *args, **kw)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Desktop/Trade/venv/lib/python3.12/site-packages/tenacity/__init__.py", line 470, in __call__
+    do = self.iter(retry_state=retry_state)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Desktop/Trade/venv/lib/python3.12/site-packages/tenacity/__init__.py", line 371, in iter
+    result = action(retry_state)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Desktop/Trade/venv/lib/python3.12/site-packages/tenacity/__init__.py", line 414, in exc_check
+    raise retry_exc from fut.exception()
+tenacity.RetryError: RetryError[<Future at 0x77ff3030fa10 state=finished raised ValueError>]
+2026-02-16 05:12:59,254 | INFO    | Web server shutting down…
+2026-02-16 05:17:42,877 | INFO    | Starting uvicorn server on 0.0.0.0:8000
+2026-02-16 05:17:42,889 | INFO    | Web server starting. Launching scanner in background…
+2026-02-16 05:17:45,889 | INFO    | Starting trading scanner thread…
+2026-02-16 05:17:45,890 | INFO    | Scanner engine started 🚀 (free-tier safe + profitable mode)
+2026-02-16 05:17:46,586 | INFO    | Telegram message sent successfully: SYSTEM (attempt 1)
+2026-02-16 05:17:46,590 | INFO    | Starting scan round ─ 05:17:46
+2026-02-16 05:17:46,590 | INFO    | → EUR/USD
+2026-02-16 05:17:46,591 | INFO    | Analyzing EUR/USD
+2026-02-16 05:17:46,864 | WARNING | TwelveData LIMIT → trying Finnhub...
+2026-02-16 05:17:49,419 | INFO    | yfinance success: price = 1.1870845556259155
+2026-02-16 05:17:56,060 | INFO    | HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-02-16 05:17:56,204 | INFO    | AI decision EUR/USD (source: yfinance): {'verdict': 'BUY', 'confidence': 70, 'reason': 'Above EMA20'}
+2026-02-16 05:17:56,205 | INFO    | Skipped EUR/USD – conf 70% < 84%
+2026-02-16 05:18:26,205 | INFO    | → GBP/USD
+2026-02-16 05:18:26,206 | INFO    | Analyzing GBP/USD
+2026-02-16 05:18:26,554 | WARNING | TwelveData LIMIT → trying Finnhub...
+2026-02-16 05:18:27,936 | INFO    | yfinance success: price = 1.3642191886901855
+2026-02-16 05:18:28,915 | INFO    | HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-02-16 05:18:28,918 | INFO    | AI decision GBP/USD (source: yfinance): {'verdict': 'SELL', 'confidence': 60, 'reason': 'Below EMA20'}
+2026-02-16 05:18:28,920 | INFO    | Skipped GBP/USD – conf 60% < 84%
+2026-02-16 05:18:51,119 | INFO    | Web server shutting down…

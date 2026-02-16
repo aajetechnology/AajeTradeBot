@@ -11,3 +11,4 @@ pandas-ta
 pytz
 tenacity          
 schedule          
+yfinance
