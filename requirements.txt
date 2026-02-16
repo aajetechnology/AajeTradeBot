@@ -9,3 +9,5 @@ python-dotenv
 pandas
 pandas-ta
 pytz
+tenacity          
+schedule          

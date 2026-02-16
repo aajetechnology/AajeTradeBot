@@ -1,131 +1,270 @@
 import os
 import time
-import re  # Added for robust AI response parsing
+import json
+import logging
+from datetime import datetime
+from typing import Dict, Optional, Tuple
+
 import finnhub
 import pandas as pd
 import pandas_ta as ta
 from twelvedata import TDClient
 from groq import Groq
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential
+
 from notifier import send_telegram_signal
+
+# ─── Logging setup ────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-7s | %(message)s',
+    handlers=[logging.FileHandler("bot_logic.log"), logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# Initialize Clients
-td = TDClient(apikey=os.getenv('TWELVE_DATA_KEY'))
-fh_client = finnhub.Client(api_key=os.getenv('FINNHUB_API_KEY'))
+# Clients
+td_client = TDClient(apikey=os.getenv('TWELVE_DATA_KEY'))
+finnhub_client = finnhub.Client(api_key=os.getenv('FINNHUB_API_KEY'))
 groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
 
-# --- RISK & SESSION TRACKING ---
-trade_stats = {"wins": 0, "losses": 0, "start_time": time.time()}
-DAILY_LOSS_LIMIT = 5 
+# Config
+CONF_THRESHOLD    = int(os.getenv('CONF_THRESHOLD', 84))
+SCAN_INTERVAL_SEC = int(os.getenv('SCAN_INTERVAL_SEC', 120))  # 2 minutes default
+GROQ_MODEL        = os.getenv('GROQ_MODEL', 'mixtral-8x7b-32768')
 
-def get_all_tradable_assets():
-    return ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "EUR/JPY", "BTC/USD", "ETH/USD"]
+# State
+stats = {"wins": 0, "losses": 0, "start": time.time(), "pending": {}}
+hourly_best = {"symbol": "—", "conf": 0}
+last_heartbeat = 0.0
 
-def get_market_analysis(symbol):
-    """Performs analysis with built-in retry logic for timeouts."""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # 1. Fetch Data
-            ts = td.time_series(symbol=symbol, interval="1min", outputsize=100)
-            df = ts.as_pandas()
-            
-            if df is None or df.empty:
-                return None, None
+def assets():
+    """Keep small number while on free tier — add more after upgrade"""
+    return [
+        "EUR/USD",
+        "GBP/USD",
+        "USD/JPY",
+        "BTC/USD",
+        "ETH/USD",
+        # "AUD/USD",
+        # "USD/CAD",
+        # "EUR/GBP",
+        # "EUR/JPY",
+        "GBP/JPY"
+    ]
 
-            # 2. Indicators
-            df['RSI'] = ta.rsi(df['close'], length=14)
-            df['EMA'] = ta.ema(df['close'], length=20)
-            last_row = df.dropna().iloc[-1]
 
-            # 3. News 
-            try:
-                news = fh_client.general_news('forex', min_id=0)
-                headline = news[0]['headline'] if news else "Stable Market"
-            except:
-                headline = "Neutral"
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(min=15, max=60))
+def get_decision(symbol: str) -> Tuple[Optional[dict], Optional[float]]:
+    """Fetch data, compute indicators, ask Groq — with safe column handling"""
+    logger.info(f"Analyzing {symbol}")
 
-            # 4. AI Decision
-            prompt = (f"Asset: {symbol} | Price: {last_row['close']} | RSI: {last_row['RSI']:.2f} | "
-                      f"EMA: {'Above' if last_row['close'] > last_row['EMA'] else 'Below'} | "
-                      f"News: {headline}. Provide Verdict: [BUY/SELL/WAIT] and Confidence %.")
-            
-            chat = groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama-3.1-8b-instant",
-                max_tokens=80
-            )
-            return chat.choices[0].message.content, last_row['close']
-
-        except Exception as e:
-            if "timeout" in str(e).lower() and attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 5
-                print(f"🔄 Timeout for {symbol}. Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            print(f"⚠️ Analysis Error ({symbol}): {e}")
+    # 1. Time series data (this is the credit-consuming call)
+    try:
+        ts = td_client.time_series(symbol=symbol, interval="1min", outputsize=180)
+        df = ts.as_pandas()
+        if df is None or len(df) < 60:
+            logger.warning(f"Insufficient data for {symbol}")
+            return None, None
+    except Exception as e:
+        err_str = str(e).lower()
+        if "api credits" in err_str or "out of api credits" in err_str or "429" in err_str or "limit being 8" in err_str:
+            logger.warning(f"Twelve Data RATE LIMIT → sleeping 90s to reset minute...")
+            time.sleep(90)
+            raise  # let tenacity retry
+        else:
+            logger.warning(f"Twelve Data fetch failed {symbol}: {e}")
             return None, None
 
-def run_scanner():
-    """Main loop with Heartbeat and AI-Safe Parsing."""
-    print("🚀 Trading Bot Engine Started...")
-    
-    # Track the best setup found so you know the bot is "thinking"
-    hourly_best = {"symbol": "None", "conf": 0}
+    # 2. Technical indicators
+    df.ta.rsi(length=14, append=True)
+    df.ta.ema(length=20, append=True)
+    df.ta.macd(append=True)
+    df.ta.bbands(length=20, std=2, append=True)
+    df.ta.adx(append=True)
+
+    row = df.iloc[-1]
+
+    # Safe column access with fallbacks
+    def safe_float(col: str, fallback=float('nan')) -> float:
+        return float(row[col]) if col in row else fallback
+
+    ind = {
+        "price": safe_float("close"),
+        "rsi": safe_float("RSI_14"),
+        "ema20": safe_float("EMA_20"),
+        "macd": safe_float("MACD_12_26_9"),
+        "macd_sig": safe_float("MACDs_12_26_9"),
+        "bb_upper": safe_float("BBU_20_2.0") or safe_float("BBU_20_2", float('nan')),
+        "bb_lower": safe_float("BBL_20_2.0") or safe_float("BBL_20_2", float('nan')),
+        "adx": safe_float("ADX_14"),
+    }
+
+    # Optional: uncomment once to see actual column names in your environment
+    # logger.info(f"TA columns for {symbol}: {list(df.columns)}")
+
+    # 3. News from Finnhub (cheap & generous limit)
+    try:
+        category = 'crypto' if 'USD' in symbol and any(c in symbol for c in ['BTC','ETH']) else 'forex'
+        news = finnhub_client.general_news(category, min_id=0)
+        headline = news[0]["headline"][:140] if news else "—"
+    except:
+        headline = "—"
+
+    # 4. Structured prompt for Groq
+    prompt = f"""Binary options analyst (2 min expiry).
+Data for {symbol}:
+
+Price     : {ind['price']:.5f}
+RSI(14)   : {ind['rsi']:.1f}
+vs EMA20  : {'above' if ind['price'] > ind['ema20'] else 'below'}
+MACD      : {ind['macd']:.4f}  (sig {ind['macd_sig']:.4f})
+ADX(14)   : {ind['adx']:.1f}
+BBands    : {'upper' if ind['price'] > ind['bb_upper']*0.98 else 'lower' if ind['price'] < ind['bb_lower']*1.02 else 'middle'}
+News      : {headline}
+
+Respond ONLY with valid JSON:
+
+{{
+  "verdict": "BUY"|"SELL"|"WAIT",
+  "confidence": 50-100,
+  "reason": "short explanation max 70 chars"
+}}
+"""
+
+    try:
+        resp = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.25,
+            max_tokens=140
+        )
+        text = resp.choices[0].message.content.strip()
+        data = json.loads(text)
+        return data, ind["price"]
+    except Exception as e:
+        logger.error(f"Groq / parse error {symbol}: {e}")
+        return None, None
+
+
+def check_outcome(signal_id: str):
+    if signal_id not in stats["pending"]:
+        return
+
+    item = stats["pending"].pop(signal_id)
+    symbol = item["symbol"]
+    direction = item["dir"]
+    entry = item["price"]
+
+    try:
+        ts = td_client.time_series(symbol=symbol, interval="1min", outputsize=1)
+        df = ts.as_pandas()
+        if df.empty:
+            return
+        exit_price = float(df.iloc[-1]["close"])
+
+        won = (direction == "BUY" and exit_price > entry) or \
+              (direction == "SELL" and exit_price < entry)
+
+        if won:
+            stats["wins"] += 1
+            tag = "✅ WIN"
+        else:
+            stats["losses"] += 1
+            tag = "❌ LOSS"
+
+        msg = (
+            f"**SIGNAL RESULT** {tag}\n"
+            f"{symbol} {direction} @ {entry:.5f}\n"
+            f"Exit: {exit_price:.5f}\n"
+            f"W/L: {stats['wins']}–{stats['losses']}"
+        )
+        send_telegram_signal("SYSTEM", msg)
+
+    except Exception as e:
+        logger.error(f"Outcome check failed {symbol}: {e}")
+
+
+def analyze_one(symbol: str):
+    global hourly_best
+
+    decision, price = get_decision(symbol)
+    if not decision or decision["verdict"] == "WAIT":
+        return
+
+    conf = decision.get("confidence", 0)
+    dir_ = decision["verdict"]
+
+    if conf > hourly_best["conf"]:
+        hourly_best.update({"symbol": symbol, "conf": conf})
+
+    if conf < CONF_THRESHOLD:
+        return
+
+    reason = decision.get("reason", "AI signal")
+    text = f"{dir_}  {conf}%  – {reason}"
+    send_telegram_signal(symbol, text, price)
+
+    # Schedule outcome check (~2.75 min later)
+    sid = f"{symbol}_{int(time.time())}"
+    stats["pending"][sid] = {"symbol": symbol, "dir": dir_, "price": price}
+    threading.Timer(165, check_outcome, args=(sid,)).start()
+
+    logger.info(f"Signal sent → {symbol} {dir_} @ {conf}%")
+
+
+def heartbeat():
+    global last_heartbeat, hourly_best
+    msg = (
+        f"**HEARTBEAT** {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"Status: active\n"
+        f"Best this hour: {hourly_best['symbol']} ({hourly_best['conf']}%)\n"
+        f"W/L: {stats['wins']} – {stats['losses']}"
+    )
+    send_telegram_signal("SYSTEM", msg)
+
+    hourly_best = {"symbol": "—", "conf": 0}
     last_heartbeat = time.time()
-    
+
+
+def run_scanner():
+    logger.info("Scanner engine started 🚀 (free-tier safe mode)")
+
     while True:
-        # Reset daily stats every 24h
-        if time.time() - trade_stats["start_time"] > 86400:
-            trade_stats.update({"wins": 0, "losses": 0, "start_time": time.time()})
+        now = time.time()
 
-        # --- NEW: HOURLY HEARTBEAT ---
-        # Sends a Telegram update every 60 minutes even if no trade is found
-        if time.time() - last_heartbeat > 3600:
-            heartbeat_msg = (
-                f"📡 **BOT HEARTBEAT**\n"
-                f"━━━━━━━━━━━━━━\n"
-                f"✅ Status: `Active & Scanning`\n"
-                f"🔝 Best Setup this hour: `{hourly_best['symbol']} ({hourly_best['conf']}%)`\n"
-                f"🕒 Next update in: `60 mins`"
-            )
-            # Use your notifier to send a simple text
-            send_telegram_signal("SYSTEM", heartbeat_msg, "N/A")
-            
-            # Reset heartbeat trackers
-            last_heartbeat = time.time()
-            hourly_best = {"symbol": "None", "conf": 0}
+        # Daily reset
+        if now - stats["start"] > 86400:
+            stats.update({"wins": 0, "losses": 0, "start": now})
+            logger.info("Daily stats reset")
 
-        if trade_stats["losses"] >= DAILY_LOSS_LIMIT:
-            print("🛑 Daily limit reached. Paused for 1 hour.")
+        # Loss limit pause
+        if stats["losses"] >= 6:
+            logger.warning("Loss limit reached → pausing 60 min")
             time.sleep(3600)
             continue
 
-        print(f"\n--- 🕒 Scan Start: {time.strftime('%H:%M:%S')} ---")
-        
-        for symbol in get_all_tradable_assets():
-            print(f"🔍 Analyzing {symbol}...")
-            verdict, price = get_market_analysis(symbol)
-            
-            if verdict and "Confidence:" in verdict:
-                try:
-                    conf_match = re.search(r'Confidence:\s*[\*]*(\d+)', verdict)
-                    if conf_match:
-                        conf = int(conf_match.group(1))
-                        
-                        # Update the hourly best tracker
-                        if conf > hourly_best["conf"]:
-                            hourly_best = {"symbol": symbol, "conf": conf}
+        # Heartbeat ~every 59 min
+        if now - last_heartbeat > 3540:
+            heartbeat()
 
-                        if conf >= 85:
-                            print(f"✅ SIGNAL FOUND: {symbol} ({conf}%)")
-                            send_telegram_signal(symbol, verdict, price)
-                            time.sleep(30) 
-                        else:
-                            print(f"➖ Low confidence ({conf}%) for {symbol}")
-                except Exception as parse_err:
-                    print(f"⚠️ Parsing Error: {parse_err}")
-            
-            time.sleep(12)
+        logger.info(f"Starting scan round ─ {datetime.now().strftime('%H:%M:%S')}")
+
+        for sym in assets():
+            logger.info(f"→ {sym}")
+            analyze_one(sym)
+            time.sleep(15.0)          # Critical: keeps us under 8 credits/min
+
+        logger.info(f"Round finished ─ sleeping {SCAN_INTERVAL_SEC} seconds")
+        time.sleep(SCAN_INTERVAL_SEC)
+
+
+if __name__ == "__main__":
+    try:
+        run_scanner()
+    except KeyboardInterrupt:
+        logger.info("Scanner stopped by user")
+    except Exception as e:
+        logger.critical(f"Fatal error in scanner: {e}", exc_info=True)
